@@ -23,6 +23,10 @@
     <!-- FontAwesome & SheetJS -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-database-compat.js"></script>
+    <script src="firebase-config.js"></script>
 </head>
 <body class="bg-gray-100 font-sans text-gray-800 pb-20 sm:pb-6">
 
@@ -947,259 +951,45 @@
     </div>
 <!-- SCRIPT REALTIME & LOGIC QUẢN TRỊ ĐỘNG -->
     <script>
-        // ===================== CẤU HÌNH =====================
-        // Dán URL Web App của Google Apps Script (kết thúc bằng /exec). Phải giống với hub.html
-        const API_URL = "https://script.google.com/macros/s/AKfycbzbMnZCUZoVbN1nb-HMHW9jEtMGwifvO3MnjcO4TvY3mEiJRt_p-fJw1PlijqL063f74w/exec";
+        // ===================== CẤU HÌNH FIREBASE (dùng chung với master_hub.html qua firebase-config.js) =====================
+        firebase.initializeApp(KB.firebaseConfig);
+        const fbAuth = firebase.auth();
+        const _fbdb = firebase.database();
 
         const _qs = new URLSearchParams(window.location.search);
         const currentSpaId = (_qs.get('spaId') || '').trim().replace(/[^A-Za-z0-9_-]/g, '');
-        // Mã cơ sở dùng làm tiền tố đường dẫn dữ liệu; SheetDB tự bỏ tiền tố này khi gửi lên server
         const SPA_PATH = currentSpaId ? `spas/${currentSpaId}` : null;
-        // Phiên đăng nhập tách riêng theo chi nhánh
-        const SESSION_KEY = `kimbeauty_user_${currentSpaId || 'none'}`;
-        // Ghi nhớ đăng nhập: tick = lưu lâu dài trên thiết bị (localStorage), bỏ tick = chỉ giữ đến khi đóng trình duyệt (sessionStorage)
         const LASTUSER_KEY = `kimbeauty_lastuser_${currentSpaId || 'none'}`;
-        let rememberLogin = !sessionStorage.getItem(SESSION_KEY);
-        function saveSession(obj) {
-            const v = JSON.stringify(obj);
-            if (rememberLogin) { localStorage.setItem(SESSION_KEY, v); sessionStorage.removeItem(SESSION_KEY); }
-            else { sessionStorage.setItem(SESSION_KEY, v); localStorage.removeItem(SESSION_KEY); }
-        }
-        function loadSession() { return localStorage.getItem(SESSION_KEY) || sessionStorage.getItem(SESSION_KEY); }
-        function clearSession() { localStorage.removeItem(SESSION_KEY); sessionStorage.removeItem(SESSION_KEY); }
+        // Ghi nhớ đăng nhập: tick = Firebase giữ phiên lâu dài trên thiết bị, bỏ tick = chỉ giữ đến khi đóng trình duyệt
+        let rememberLogin = true;
 
         let listenersAttached = false;
         const dynListeners = {};
-        let session = null;      // { token, user }
         let spaMeta = {};
 
-        // ===================== GỌI API APPS SCRIPT =====================
-        async function api(action, body = {}) {
-            let res;
-            try {
-                res = await fetch(API_URL, {
-                    method: 'POST', // không đặt header -> text/plain, tránh preflight CORS với Apps Script
-                    body: JSON.stringify({ action, spaId: currentSpaId, token: session ? session.token : undefined, ...body })
-                });
-            } catch (e) { e.network = true; throw e; }
-            let json;
-            try { json = await res.json(); } catch (e) { e.network = true; throw e; }
-            if (json.status === 'expired') { showExpiredScreen(); throw new Error('expired'); }
-            if (json.status === 'unauthorized' && session) {
-                forceLogout(SheetDB.isReady() ? (json.message || 'Phiên đăng nhập đã hết hạn.') : '');
-                throw new Error('unauthorized');
-            }
-            return json;
+        // ===================== LỚP DỮ LIỆU: bọc Firebase để code POS cũ dùng lại nguyên vẹn =====================
+        const cleanVal = (v) => (v === undefined) ? null : (v === null || typeof v !== 'object') ? v : JSON.parse(JSON.stringify(v)); // bỏ các trường undefined
+        function dbError(err) {
+            console.error(err);
+            if (err && /permission_denied/i.test(err.code || err.message || '')) alert('Bạn không có quyền thực hiện thao tác này, hoặc cơ sở đã hết hạn / bị khóa.');
+            else alert('Không lưu được: ' + (err && err.message || err));
         }
+        const wrapCb = (cb) => (err) => { if (err) dbError(err); if (cb) cb(err); };
+        const db = {
+            ref: (path) => {
+                const r = _fbdb.ref(path);
+                return {
+                    on: (ev, cb, errCb) => r.on(ev, cb, errCb || ((e) => console.error('Lỗi đọc dữ liệu ' + path, e))),
+                    off: (ev, cb) => r.off(ev, cb),
+                    once: (ev, cb) => r.once(ev, cb),
+                    set: (v, cb) => r.set(cleanVal(v), wrapCb(cb)),
+                    update: (v, cb) => r.update(cleanVal(v), wrapCb(cb)),
+                    push: (v, cb) => (v === undefined ? r.push() : r.push(cleanVal(v), wrapCb(cb))),
+                    remove: (cb) => r.remove(wrapCb(cb))
+                };
+            }
+        };
 
-        // ===================== SHEETDB: DB "GIỐNG FIREBASE" LƯU TRÊN GOOGLE SHEET =====================
-        // Giữ nguyên giao diện db.ref(path).on/once/set/update/push/remove để toàn bộ code POS dùng lại được.
-        // Dữ liệu nằm trong bộ nhớ, ghi lạc quan (hiện ngay) rồi đẩy lên Sheet; định kỳ kiểm tra thay đổi từ máy khác.
-        const SheetDB = (() => {
-            let cache = {}, ready = false, version = null, me = null;
-            let pending = [], flushing = false, flushTimer = null, editSeq = 0, pollTimer = null;
-            const listeners = [], whenReady = [];
-
-            const segsOf = (p) => {
-                let s = String(p || '').split('/').filter(Boolean);
-                if (s[0] === 'spas' && s[1] === currentSpaId) s = s.slice(2);
-                return s;
-            };
-            const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
-            const getIn = (o, segs) => segs.reduce((x, k) => (x == null ? undefined : x[k]), o);
-            function setIn(o, segs, v) {
-                for (let i = 0; i < segs.length - 1; i++) {
-                    if (o[segs[i]] == null || typeof o[segs[i]] !== 'object') o[segs[i]] = {};
-                    o = o[segs[i]];
-                }
-                o[segs[segs.length - 1]] = v;
-            }
-            function removeIn(o, segs) {
-                for (let i = 0; i < segs.length - 1; i++) { if (o[segs[i]] == null) return; o = o[segs[i]]; }
-                if (Array.isArray(o)) o.splice(Number(segs[segs.length - 1]), 1);
-                else delete o[segs[segs.length - 1]];
-            }
-            const toMap = (v) => Array.isArray(v) ? Object.fromEntries(v.map((x, i) => [String(i), x])) : v;
-            function scrubUsers() { Object.values(cache.users || {}).forEach(u => { if (u) delete u.password; }); }
-
-            function applyLocal(segs, op, value) {
-                if (!segs.length) return;
-                const coll = segs[0];
-                if (segs.length === 1) {
-                    if (op === 'set' && value != null) cache[coll] = toMap(clone(value)); else delete cache[coll];
-                } else {
-                    cache[coll] = cache[coll] || {};
-                    if (op === 'remove' || value == null) removeIn(cache[coll], segs.slice(1));
-                    else setIn(cache[coll], segs.slice(1), clone(value));
-                }
-                if (coll === 'users') scrubUsers();
-            }
-
-            function snapshot(segs) {
-                const v = getIn(cache, segs);
-                const copy = v === undefined ? null : clone(v);
-                return { val: () => copy, exists: () => copy !== null, key: segs[segs.length - 1] || null };
-            }
-            function notifyOne(l, force) {
-                const snap = snapshot(l.segs);
-                const ser = JSON.stringify(snap.val());
-                if (force || l.last !== ser) {
-                    l.last = ser;
-                    try { l.cb(snap); } catch (e) { console.error(e); }
-                }
-            }
-            function notify(force) { listeners.slice().forEach(l => notifyOne(l, force)); }
-
-            // ---- Badge trạng thái đồng bộ ----
-            let badgeTimer = null;
-            function setStatus(state, msg) {
-                let el = document.getElementById('syncBadge');
-                if (!el) {
-                    el = document.createElement('div');
-                    el.id = 'syncBadge';
-                    el.className = 'fixed bottom-20 sm:bottom-4 left-3 z-[60] text-[10px] font-bold px-2.5 py-1 rounded-full shadow border transition-opacity';
-                    document.body.appendChild(el);
-                }
-                const styles = { saving: ['⏳ Đang lưu lên Google Sheet...', 'bg-amber-50 text-amber-800 border-amber-200'],
-                                 ok: ['✅ Đã đồng bộ Google Sheet', 'bg-emerald-50 text-emerald-800 border-emerald-200'],
-                                 error: [msg || '⚠️ Mất kết nối, đang thử lại...', 'bg-red-50 text-red-700 border-red-200'] };
-                const [text, cls] = styles[state];
-                el.textContent = text;
-                el.className = 'fixed bottom-20 sm:bottom-4 left-3 z-[60] text-[10px] font-bold px-2.5 py-1 rounded-full shadow border transition-opacity ' + cls;
-                el.style.opacity = '1';
-                clearTimeout(badgeTimer);
-                if (state === 'ok') badgeTimer = setTimeout(() => { el.style.opacity = '0'; }, 1800);
-            }
-
-            // ---- Đẩy thao tác ghi lên server (gộp lô) ----
-            function enqueue(op, cb) {
-                editSeq++;
-                pending.push({ op, cb });
-                setStatus('saving');
-                if (!flushTimer) flushTimer = setTimeout(flush, 150);
-            }
-            async function flush() {
-                flushTimer = null;
-                if (flushing || !pending.length) return;
-                flushing = true;
-                const batch = pending.splice(0, pending.length);
-                let retry = false;
-                try {
-                    const r = await api('ops', { ops: batch.map(b => b.op) });
-                    if (r.status !== 'success') throw new Error(r.message || 'Lỗi lưu dữ liệu');
-                    batch.forEach(b => b.cb && b.cb(null));
-                } catch (err) {
-                    if (err.network) {
-                        pending.unshift(...batch); retry = true;
-                        setStatus('error');
-                    } else if (err.message !== 'expired' && err.message !== 'unauthorized') {
-                        batch.forEach(b => b.cb && b.cb(err));
-                        if (/10000000|cells|limit|exceed|quota|storage|dung lượng/i.test(err.message || '')) {
-                            alert('⚠️ GOOGLE SHEET CỦA CƠ SỞ ĐÃ ĐẦY nên không lưu được dữ liệu vừa nhập.\n\nVui lòng báo Admin để xóa bớt dữ liệu cũ hoặc chuyển sang Google Sheet mới.\n\n(Chi tiết: ' + err.message + ')');
-                        } else {
-                            alert('Không lưu được: ' + err.message);
-                        }
-                        try { await loadAll(); } catch (e) {}
-                    }
-                } finally {
-                    flushing = false;
-                    if (retry) flushTimer = setTimeout(flush, 5000);
-                    else if (pending.length) flushTimer = setTimeout(flush, 0);
-                    else if (ready) setStatus('ok');
-                }
-            }
-
-            function write(segs, op, value, cb) {
-                if (!segs.length) { cb && cb(new Error('Đường dẫn rỗng')); return; }
-                applyLocal(segs, op, value);
-                notify(false);
-                enqueue({ op, path: segs.join('/'), value: value === undefined ? null : clone(value) }, cb);
-            }
-
-            // ---- Tải dữ liệu ----
-            async function loadAll() {
-                const r = await api('getAll', {});
-                if (r.status !== 'success') throw new Error(r.message || 'Không tải được dữ liệu');
-                cache = r.data || {}; version = r.version; me = r.me;
-                const first = !ready;
-                ready = true;
-                notify(true);
-                if (first) whenReady.splice(0).forEach(fn => fn());
-            }
-            async function poll() {
-                if (!ready || document.hidden || flushing || pending.length) return;
-                const seq = editSeq;
-                try {
-                    const r = await api('getAll', { since: version, sinceUser: session.user.username });
-                    if (editSeq !== seq || flushing || pending.length) return; // có thay đổi cục bộ -> bỏ kết quả cũ
-                    if (r.status === 'success' && !r.unchanged) {
-                        cache = r.data || {}; version = r.version; me = r.me;
-                        notify(false);
-                        if (SheetDB.onMe) SheetDB.onMe(me);
-                    }
-                    if (!pending.length) setStatus('ok');
-                } catch (e) { if (e.network) setStatus('error'); }
-            }
-
-            return {
-                onMe: null,
-                isReady: () => ready,
-                hasPending: () => pending.length > 0 || flushing,
-                getMe: () => me,
-                async start() {
-                    await loadAll();
-                    clearInterval(pollTimer);
-                    pollTimer = setInterval(poll, 8000);
-                },
-                stop() {
-                    clearInterval(pollTimer); clearTimeout(flushTimer); flushTimer = null;
-                    cache = {}; ready = false; version = null; me = null; pending = [];
-                },
-                refresh: poll,
-                ref(path) {
-                    const segs = segsOf(path);
-                    const self = {
-                        on(_e, cb) {
-                            const l = { segs, cb, last: undefined };
-                            listeners.push(l);
-                            if (ready) setTimeout(() => notifyOne(l, true), 0);
-                            return cb;
-                        },
-                        off(_e, cb) {
-                            for (let i = listeners.length - 1; i >= 0; i--) {
-                                if (listeners[i].cb === cb || (!cb && listeners[i].segs.join('/') === segs.join('/'))) listeners.splice(i, 1);
-                            }
-                        },
-                        once(_e, cb) {
-                            return new Promise(resolve => {
-                                const run = () => { const s = snapshot(segs); if (cb) cb(s); resolve(s); };
-                                ready ? run() : whenReady.push(run);
-                            });
-                        },
-                        set(value, cb) { write(segs, 'set', value, cb); return Promise.resolve(); },
-                        update(obj, cb) {
-                            const keys = Object.keys(obj || {});
-                            if (!keys.length) { cb && cb(null); return Promise.resolve(); }
-                            keys.forEach((k, i) => write(segs.concat(k.split('/')), 'set', obj[k], i === keys.length - 1 ? cb : undefined));
-                            return Promise.resolve();
-                        },
-                        remove(cb) { write(segs, 'remove', null, cb); return Promise.resolve(); },
-                        push(value, cb) {
-                            const key = '-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-                            write(segs.concat(key), 'set', value, cb);
-                            return { key };
-                        }
-                    };
-                    return self;
-                }
-            };
-        })();
-        const db = { ref: (p) => SheetDB.ref(p) };
-
-        // Cảnh báo nếu đóng trang khi dữ liệu chưa kịp lưu
-        window.addEventListener('beforeunload', (e) => {
-            if (SheetDB.hasPending()) { e.preventDefault(); e.returnValue = ''; }
-        });
 
         let currentUser = null;
         let currentActiveCustKey = null;
@@ -1356,76 +1146,135 @@
             document.getElementById('authScreen').classList.remove('hidden');
         }
 
-        // Vào ứng dụng sau khi đã có token hợp lệ
-        async function enterApp(token, user) {
-            session = { token, user };
-            await SheetDB.start();                       // tải dữ liệu từ Google Sheet của cơ sở
-            const me = SheetDB.getMe() || user;
-            currentUser = { username: me.username, fullName: me.fullName, role: me.role, permissions: me.permissions || {}, spaId: currentSpaId };
-            session.user = currentUser;
-            saveSession({ spaId: currentSpaId, token, user: currentUser });
+        // ===================== TÀI KHOẢN & ĐĂNG NHẬP (Firebase Authentication) =====================
+        // Tạo tài khoản đăng nhập bằng "phiên phụ" để không làm văng phiên của người đang thao tác
+        async function createAuthUser(email, password) {
+            const app2 = firebase.initializeApp(KB.firebaseConfig, 'sec' + Date.now());
+            try {
+                const c = await app2.auth().createUserWithEmailAndPassword(email, password);
+                const uid = c.user.uid;
+                await app2.auth().signOut();
+                return uid;
+            } catch (e) {
+                if (e.code === 'auth/email-already-in-use') throw new Error('Tên đăng nhập này đã được dùng trước đó. Vui lòng chọn tên khác.');
+                throw e;
+            } finally { await app2.delete(); }
+        }
+
+        async function changeOwnPassword(newPass) {
+            const u = fbAuth.currentUser;
+            if (!u) throw new Error('Chưa đăng nhập.');
+            try { await u.updatePassword(newPass); }
+            catch (e) {
+                if (e.code !== 'auth/requires-recent-login') throw e;
+                const old = prompt('Vì lý do bảo mật, hãy nhập MẬT KHẨU HIỆN TẠI để xác nhận:');
+                if (!old) throw new Error('Đã hủy đổi mật khẩu.');
+                await u.reauthenticateWithCredential(firebase.auth.EmailAuthProvider.credential(u.email, old));
+                await u.updatePassword(newPass);
+            }
+        }
+
+        function showAuthForm(mode) {
+            const loginForm = document.getElementById('loginForm');
+            const initForm = document.getElementById('initSuperAdminForm');
+            const subtitle = document.getElementById('authSubtitle');
+            if (mode === 'init') {
+                loginForm.classList.add('hidden');
+                initForm.classList.remove('hidden');
+                subtitle.innerText = 'Cơ sở này chưa có tài khoản. Vui lòng tạo Super Admin đầu tiên!';
+            } else {
+                initForm.classList.add('hidden');
+                loginForm.classList.remove('hidden');
+                subtitle.innerText = 'Đăng nhập hệ thống quản lý Spa';
+                const lastUser = localStorage.getItem(LASTUSER_KEY);
+                const uEl = document.getElementById('loginUsername');
+                if (lastUser && uEl && !uEl.value) { uEl.value = lastUser; document.getElementById('loginPassword').focus(); }
+            }
+            document.getElementById('mainApp').classList.add('hidden');
+            document.getElementById('authScreen').classList.remove('hidden');
+        }
+
+        let _meWatchers = [];
+        function stopWatchMe() { _meWatchers.forEach(w => w.ref.off('value', w.cb)); _meWatchers = []; }
+        // Quyền / tên của tài khoản bị đổi từ máy khác -> áp dụng ngay
+        function watchMe(uid, username) {
+            stopWatchMe();
+            let mem = null, prof = null;
+            const apply = () => {
+                if (!currentUser || !mem || !prof) return;
+                const next = { ...currentUser, fullName: prof.fullName || username, role: mem.role, permissions: prof.permissions || {} };
+                if (next.role !== currentUser.role || next.fullName !== currentUser.fullName || JSON.stringify(next.permissions) !== JSON.stringify(currentUser.permissions)) {
+                    currentUser = next;
+                    applyUserPermissions();
+                }
+            };
+            const rm = db.ref('members/' + uid), rp = db.ref(`${SPA_PATH}/users/${username}`);
+            const cm = (snap) => { mem = snap.val(); if (!mem) forceLogout('Tài khoản của bạn đã bị gỡ khỏi cơ sở.'); else apply(); };
+            const cp = (snap) => { prof = snap.val() || {}; apply(); };
+            rm.on('value', cm); rp.on('value', cp);
+            _meWatchers = [{ ref: rm, cb: cm }, { ref: rp, cb: cp }];
+        }
+
+        // Vào ứng dụng sau khi đã đăng nhập Firebase
+        async function enterApp(user) {
+            const mem = (await db.ref('members/' + user.uid).once('value')).val();
+            if (!mem || mem.spaId !== currentSpaId) throw new Error('wrong-spa');
+            const prof = (await db.ref(`${SPA_PATH}/users/${mem.username}`).once('value')).val() || {};
+            currentUser = { username: mem.username, fullName: prof.fullName || mem.username, role: mem.role, permissions: prof.permissions || {}, spaId: currentSpaId, uid: user.uid };
+            watchMe(user.uid, mem.username);
             applyUserPermissions();
         }
 
-        // Quyền của tài khoản bị đổi từ máy khác -> áp dụng ngay
-        SheetDB.onMe = (me) => {
-            if (!currentUser || !me) return;
-            if (me.role !== currentUser.role || JSON.stringify(me.permissions || {}) !== JSON.stringify(currentUser.permissions || {}) || me.fullName !== currentUser.fullName) {
-                currentUser = { ...currentUser, fullName: me.fullName, role: me.role, permissions: me.permissions || {} };
-                session.user = currentUser;
-                saveSession({ spaId: currentSpaId, token: session.token, user: currentUser });
-                applyUserPermissions();
-            }
-        };
-
         function forceLogout(msg) {
-            clearSession();
-            session = null; currentUser = null;
-            SheetDB.stop();
-            showAuthForm('login');
-            if (msg) alert(msg);
+            stopWatchMe();
+            fbAuth.signOut().finally(() => {
+                if (msg) alert(msg);
+                location.reload(); // tải lại để xóa sạch dữ liệu của phiên cũ
+            });
+        }
+
+        let _registryWatching = false;
+        function watchRegistry() {
+            if (_registryWatching) return;
+            _registryWatching = true;
+            // Hub gia hạn / khóa thì POS cập nhật ngay
+            db.ref('registry/' + currentSpaId).on('value', (snap) => {
+                const st = snap.val();
+                if (!st || st.disabled === true || !(Number(st.expireAt) > Date.now())) { showExpiredScreen(); return; }
+                spaMeta = st;
+                startPosCountdown(st.expireAt);
+            });
         }
 
         async function checkSystemHasUsers() {
             if (!SPA_PATH) return;
             try {
-                const st = await api('spaStatus');
-                if (st.status !== 'success') {
-                    showFatalScreen('⚠️', 'KHÔNG THỂ MỞ CƠ SỞ', `<p style="font-size:14px; color:#cbd5e1;">${st.message || 'Lỗi không xác định'}</p>`);
+                const st = (await db.ref('registry/' + currentSpaId).once('value')).val();
+                if (!st) {
+                    showFatalScreen('⚠️', 'KHÔNG THỂ MỞ CƠ SỞ', '<p style="font-size:14px; color:#cbd5e1;">Cơ sở không tồn tại hoặc đã bị xóa.</p>');
                     return;
                 }
+                if (st.disabled === true || !(Number(st.expireAt) > Date.now())) { showExpiredScreen(); return; }
                 spaMeta = st;
                 startPosCountdown(st.expireAt);
                 if (st.name) {
                     document.title = st.name + ' - POS';
                     document.querySelectorAll('#authScreen h1, #mainApp header h2').forEach(el => el.textContent = st.name);
                 }
+                watchRegistry();
 
-                // Cơ sở mới tinh -> bắt buộc tạo Super Admin đầu tiên
-                if (!st.hasUsers) {
-                    clearSession();
-                    showAuthForm('init');
-                    return;
-                }
+                // Cơ sở mới tinh (chưa có chủ) -> bắt buộc tạo Super Admin đầu tiên
+                const owner = (await db.ref(`${SPA_PATH}/owner`).once('value')).val();
+                if (!owner) { showAuthForm('init'); return; }
 
-                // Có phiên đã lưu -> server xác thực lại token
-                const saved = loadSession();
-                if (saved) {
-                    try {
-                        const s = JSON.parse(saved);
-                        if (s && s.spaId === currentSpaId && s.token) {
-                            await enterApp(s.token, s.user || {});
-                            return;
-                        }
-                    } catch (e) {
-                        if (e.message === 'expired') return;
-                    }
-                    clearSession();
-                    session = null;
+                // Phiên Firebase đã lưu trên thiết bị -> tự vào luôn
+                const u = await new Promise(res => { const un = fbAuth.onAuthStateChanged(x => { un(); res(x); }); });
+                if (u) {
+                    try { await enterApp(u); return; }
+                    catch (e) { await fbAuth.signOut(); }
                 }
                 showAuthForm('login');
             } catch (err) {
-                if (err.message === 'expired' || err.message === 'unauthorized') return;
                 console.error(err);
                 document.getElementById('authSubtitle').innerText = 'Không kết nối được hệ thống: ' + err.message;
                 document.getElementById('authScreen').classList.remove('hidden');
@@ -1448,16 +1297,32 @@
 
             btn.disabled = true;
             try {
-                const r = await api('initAdmin', { fullName, username, password });
-                if (r.status !== 'success') {
-                    alert(r.message);
-                    if (/đã có tài khoản/.test(r.message || '')) checkSystemHasUsers();
-                    return;
+                if ((await db.ref(`${SPA_PATH}/owner`).once('value')).val()) { alert('Cơ sở này đã có tài khoản, vui lòng đăng nhập.'); checkSystemHasUsers(); return; }
+                const cred = await fbAuth.createUserWithEmailAndPassword(KB.loginEmail(currentSpaId, username, 0), password);
+                const uid = cred.user.uid;
+                try {
+                    await _fbdb.ref(`${SPA_PATH}/owner`).set(uid);       // giành quyền chủ cơ sở (chỉ 1 người thành công)
+                } catch (ex) {
+                    await cred.user.delete();
+                    alert('Cơ sở này vừa được người khác khởi tạo. Vui lòng đăng nhập.');
+                    checkSystemHasUsers(); return;
                 }
-                await enterApp(r.token, r.user);
+                await _fbdb.ref('members/' + uid).set({ spaId: currentSpaId, role: 'SUPER_ADMIN', username });
+                const today = todayLocalStr();
+                const upd = {};
+                upd[`${SPA_PATH}/users/${username}`] = {
+                    fullName: fullName || username, uid, role: 'SUPER_ADMIN',
+                    baseSalary: 10000000, workingDaysPerMonth: 30, standardHoursPerDay: 8,
+                    salaryHistory: [{ baseSalary: 10000000, effectiveDate: today }],
+                    permissions: { logs: true, booking: true, customers: true, services: true, staff: true }
+                };
+                upd[`loginIndex/${currentSpaId}/${username}`] = 0;
+                await _fbdb.ref().update(upd);
+                await enterApp(cred.user);
                 alert('Khởi tạo Super Admin thành công cho cơ sở này!');
             } catch (err) {
-                if (err.message !== 'expired') alert('Lỗi: ' + err.message);
+                if (err.code === 'auth/email-already-in-use') alert('Tên đăng nhập này đã tồn tại. Vui lòng chọn tên khác.');
+                else alert('Lỗi: ' + err.message);
             } finally { btn.disabled = false; }
         }
 
@@ -1468,14 +1333,18 @@
             const password = document.getElementById('loginPassword').value;
             btn.disabled = true;
             try {
-                const r = await api('login', { username, password });
-                if (r.status !== 'success') { alert(r.message || 'Sai tên đăng nhập hoặc mật khẩu!'); return; }
-                document.getElementById('loginPassword').value = '';
+                const ver = (await db.ref(`loginIndex/${currentSpaId}/${username}`).once('value')).val();
+                if (ver === null || ver === undefined) { alert('Sai tên đăng nhập hoặc mật khẩu!'); return; }
                 rememberLogin = document.getElementById('loginRemember').checked;
+                await fbAuth.setPersistence(rememberLogin ? firebase.auth.Auth.Persistence.LOCAL : firebase.auth.Auth.Persistence.SESSION);
+                const cred = await fbAuth.signInWithEmailAndPassword(KB.loginEmail(currentSpaId, username, ver), password);
+                document.getElementById('loginPassword').value = '';
                 if (rememberLogin) localStorage.setItem(LASTUSER_KEY, username); else localStorage.removeItem(LASTUSER_KEY);
-                await enterApp(r.token, r.user);
+                try { await enterApp(cred.user); }
+                catch (ex) { await fbAuth.signOut(); alert(ex.message === 'wrong-spa' ? 'Tài khoản này không thuộc cơ sở hiện tại.' : 'Lỗi: ' + ex.message); }
             } catch (err) {
-                if (err.message !== 'expired') alert('Lỗi kết nối: ' + err.message);
+                const bad = ['auth/invalid-credential', 'auth/wrong-password', 'auth/user-not-found', 'auth/invalid-email'];
+                alert(bad.includes(err.code) ? 'Sai tên đăng nhập hoặc mật khẩu!' : (err.code === 'auth/too-many-requests' ? 'Đăng nhập sai quá nhiều lần, vui lòng đợi ít phút rồi thử lại.' : 'Lỗi kết nối: ' + err.message));
             } finally { btn.disabled = false; }
         }
 
@@ -1494,17 +1363,17 @@
         }
         function closeChangePasswordModal() { document.getElementById('changePassModal').classList.add('hidden'); }
 
-        function handleChangePassword(e) {
+        async function handleChangePassword(e) {
             e.preventDefault();
             const newPass = document.getElementById('newPasswordInput').value;
-            if (newPass && currentUser) {
-                db.ref(SPA_PATH + '/users/' + currentUser.username + '/password').set(newPass, (err) => {
-                    if (!err) {
-                        alert('Đổi mật khẩu thành công!');
-                        closeChangePasswordModal();
-                    }
-                });
-            }
+            if (!newPass || !currentUser) return;
+            if (newPass.length < 6) { alert('Mật khẩu tối thiểu 6 ký tự.'); return; }
+            try {
+                await changeOwnPassword(newPass);
+                document.getElementById('newPasswordInput').value = '';
+                alert('Đổi mật khẩu thành công!');
+                closeChangePasswordModal();
+            } catch (err) { alert('Không đổi được mật khẩu: ' + err.message); }
         }
 
         function applyUserPermissions() {
@@ -1551,10 +1420,18 @@
         function initDataListeners() {
             if (listenersAttached) return;
             listenersAttached = true;
-            db.ref(SPA_PATH + '/users').on('value', (snap) => {
-                globalUsers = snap.val() || {};
-                generateStaffReport();
-            });
+            // Quản trị xem toàn bộ tài khoản; nhân viên chỉ đọc hồ sơ của chính mình
+            if (currentUser.role === 'SUPER_ADMIN' || currentUser.role === 'MANAGER') {
+                db.ref(SPA_PATH + '/users').on('value', (snap) => {
+                    globalUsers = snap.val() || {};
+                    generateStaffReport();
+                });
+            } else {
+                db.ref(SPA_PATH + '/users/' + currentUser.username).on('value', (snap) => {
+                    globalUsers = snap.val() ? { [currentUser.username]: snap.val() } : {};
+                    generateStaffReport();
+                });
+            }
 
             db.ref(SPA_PATH + '/levels').on('value', (snap) => {
                 const data = snap.val();
@@ -1732,7 +1609,7 @@
             if (currentUser.role !== 'SUPER_ADMIN') return;
             if (confirm(`Xóa vĩnh viễn Module "${modId}" cùng toàn bộ dữ liệu của nó?`)) {
                 db.ref(SPA_PATH + '/system_modules/' + modId).remove();
-                db.ref(SPA_PATH + '/dyn_data_' + modId).remove();
+                db.ref(SPA_PATH + '/dyn_data/' + modId).remove();
             }
         }
 
@@ -1817,7 +1694,7 @@
                 }
 
                 if (dynListeners[modId]) dynListeners[modId].ref.off('value', dynListeners[modId].cb);
-                const dynRef = db.ref(SPA_PATH + '/dyn_data_' + modId);
+                const dynRef = db.ref(SPA_PATH + '/dyn_data/' + modId);
                 const dynCb = (snap) => renderDynamicDataList(modId, snap.val() || {});
                 dynRef.on('value', dynCb);
                 dynListeners[modId] = { ref: dynRef, cb: dynCb };
@@ -1835,7 +1712,7 @@
                 record[key] = inp.value;
             });
 
-            db.ref(SPA_PATH + '/dyn_data_' + modId).push(record, (err) => {
+            db.ref(SPA_PATH + '/dyn_data/' + modId).push(record, (err) => {
                 if (!err) {
                     alert("Đã lưu dữ liệu thành công!");
                     document.getElementById(`dynForm_${modId}`).reset();
@@ -1924,7 +1801,7 @@
         }
 
         function exportDynamicModuleToExcel(modId) {
-            db.ref(SPA_PATH + '/dyn_data_' + modId).once('value', (snap) => {
+            db.ref(SPA_PATH + '/dyn_data/' + modId).once('value', (snap) => {
                 const data = snap.val() || {};
                 const mod = globalDynamicModules[modId];
                 if (!mod) return;
@@ -1958,7 +1835,7 @@
 
         function deleteDynamicDataRecord(modId, recordKey) {
             if (confirm("Xóa dòng dữ liệu này?")) {
-                db.ref(`${SPA_PATH}/dyn_data_${modId}/${recordKey}`).remove();
+                db.ref(`${SPA_PATH}/dyn_data/${modId}/${recordKey}`).remove();
             }
         }
 
@@ -2087,32 +1964,65 @@
                 staff: document.getElementById('perm_staff').checked
             };
 
-            db.ref(SPA_PATH + '/users/' + username).once('value', (snap) => {
-                if (!editUsername && snap.exists()) {
-                    alert('Tên đăng nhập "' + username + '" đã tồn tại trong cơ sở này. Vui lòng chọn tên khác.');
-                    return;
-                }
-                const existingUser = snap.val() || {};
-                let salaryHistory = existingUser.salaryHistory || [];
-
-                if (salaryHistory.length === 0) {
-                    salaryHistory.push({ baseSalary, effectiveDate });
-                } else {
-                    const lastEntry = salaryHistory[salaryHistory.length - 1];
-                    if (lastEntry.baseSalary !== baseSalary || lastEntry.effectiveDate !== effectiveDate) {
+            const submitBtn = e.target.querySelector('button[type=submit]');
+            if (submitBtn) submitBtn.disabled = true;
+            (async () => {
+                try {
+                    const userPath = `${SPA_PATH}/users/${username}`;
+                    const snap = await db.ref(userPath).once('value');
+                    if (!editUsername && snap.exists()) {
+                        alert('Tên đăng nhập "' + username + '" đã tồn tại trong cơ sở này. Vui lòng chọn tên khác.');
+                        return;
+                    }
+                    const existingUser = snap.val() || {};
+                    let salaryHistory = existingUser.salaryHistory || [];
+                    if (salaryHistory.length === 0) {
                         salaryHistory.push({ baseSalary, effectiveDate });
+                    } else {
+                        const lastEntry = salaryHistory[salaryHistory.length - 1];
+                        if (lastEntry.baseSalary !== baseSalary || lastEntry.effectiveDate !== effectiveDate) {
+                            salaryHistory.push({ baseSalary, effectiveDate });
+                        }
                     }
-                }
+                    const profile = { fullName, phone, role, baseSalary, workingDaysPerMonth: workingDays, standardHoursPerDay: standardHours, salaryHistory, permissions };
+                    const updates = {};
+                    let uid = existingUser.uid || null;
 
-                db.ref(SPA_PATH + '/users/' + username).update({
-                    fullName, phone, ...(password ? { password } : {}), role, baseSalary, workingDaysPerMonth: workingDays, standardHoursPerDay: standardHours, salaryHistory, permissions
-                }, (err) => {
-                    if (!err) {
-                        alert('Đã lưu tài khoản thành công!');
-                        resetFormSelection();
+                    if (!editUsername) {
+                        // Tài khoản mới: tạo đăng nhập Firebase + quyền thành viên
+                        if ((await _fbdb.ref(`loginIndex/${currentSpaId}/${username}`).once('value')).exists()) {
+                            alert('Tên đăng nhập "' + username + '" đã tồn tại. Vui lòng chọn tên khác.'); return;
+                        }
+                        uid = await createAuthUser(KB.loginEmail(currentSpaId, username, 0), password);
+                        updates[`members/${uid}`] = { spaId: currentSpaId, role, username };
+                        updates[`loginIndex/${currentSpaId}/${username}`] = 0;
+                        profile.uid = uid;
+                    } else if (password) {
+                        if (username === currentUser.username) {
+                            await changeOwnPassword(password);
+                        } else {
+                            // Đặt lại mật khẩu cho người khác: tạo đăng nhập mới (phiên bản +1), vô hiệu đăng nhập cũ
+                            if (!uid) throw new Error('Tài khoản này chưa liên kết đăng nhập, không thể đặt lại mật khẩu.');
+                            const ver = ((await _fbdb.ref(`loginIndex/${currentSpaId}/${username}`).once('value')).val() || 0) + 1;
+                            const newUid = await createAuthUser(KB.loginEmail(currentSpaId, username, ver), password);
+                            updates[`members/${newUid}`] = { spaId: currentSpaId, role, username };
+                            updates[`members/${uid}`] = null;
+                            updates[`loginIndex/${currentSpaId}/${username}`] = ver;
+                            profile.uid = newUid;
+                            uid = newUid;
+                        }
                     }
-                });
-            });
+                    if (editUsername && !(password && username !== currentUser.username) && uid && existingUser.role !== role) {
+                        updates[`members/${uid}/role`] = role;
+                    }
+                    Object.keys(profile).forEach(k => { updates[`${userPath}/${k}`] = cleanVal(profile[k]); });
+                    await _fbdb.ref().update(updates);
+                    alert('Đã lưu tài khoản thành công!');
+                    resetFormSelection();
+                } catch (err) {
+                    if (err.code === 'PERMISSION_DENIED') dbError(err); else alert('Lỗi: ' + err.message);
+                } finally { if (submitBtn) submitBtn.disabled = false; }
+            })();
         }
 
         function editAccount(username) {
@@ -3219,7 +3129,7 @@ const comboListContainer = document.getElementById('modalCustomerComboList');
         }
 
         function showExpiredScreen() {
-            SheetDB.stop();
+            try { _fbdb.goOffline(); } catch (e) {}
             showFatalScreen('🔒', 'Thời gian sử dụng của bạn đã hết, vui lòng liên hệ Admin:',
                 `<div style="background:#1e293b; border:1px solid #334155; padding:16px 24px; border-radius:16px; margin-top:8px;">
                     <p style="font-size:16px; color:#38bdf8; font-weight:bold; margin:0;">Zalo / SĐT: 097.897.1331 / 077.770.1992</p>
