@@ -51,7 +51,7 @@
 
         <div class="bg-amber-50 border border-amber-200 rounded-3xl p-4 text-xs text-gray-700 flex flex-wrap items-center justify-between gap-3">
             <p class="leading-relaxed">📊 <b>Theo dõi dung lượng hệ thống:</b> hub không đo được mức dùng của Firebase. Hãy vào mục <b>Usage</b> của Realtime Database mỗi tuần để xem số kết nối, dung lượng và lượng tải. Khi gần chạm giới hạn, hãy nâng cấp gói.</p>
-            <a href="https://console.firebase.google.com/project/kimbeauty-pos/database" target="_blank" class="px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl shadow-sm whitespace-nowrap">Mở Firebase Console</a>
+            <a href="https://console.firebase.google.com/project/kimbeauty-pos/database" target="_blank" rel="noopener" class="px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl shadow-sm whitespace-nowrap">Mở Firebase Console</a>
         </div>
 
         <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 space-y-4">
@@ -125,10 +125,14 @@
     </div>
 
     <script>
-        const POS_PAGE = "kimbeauty_pos.html"; // tên file POS (cùng thư mục với master_hub.html)
+        const POS_PAGE = "kimbeauty_pos.html"; // tên file POS (cùng thư mục với trang hub)
         firebase.initializeApp(KB.firebaseConfig);
         const auth = firebase.auth();
         const db = firebase.database();
+
+        // [SỬA] Phiên đăng nhập của hub chỉ thuộc tab này, để đăng nhập POS ở tab khác không làm hub bị lỗi permission_denied
+        auth.setPersistence(firebase.auth.Auth.Persistence.SESSION).catch(() => {});
+        let registryRef = null, registryRetry = 0;
 
         let spas = [];
         let timerInterval = null;
@@ -161,18 +165,39 @@
 
         function logoutAdmin() { auth.signOut().then(() => location.reload()); }
 
+        // [SỬA] Nếu phiên không còn là Admin thì quay về màn hình đăng nhập
         auth.onAuthStateChanged((user) => {
             if (user && user.uid === KB.ADMIN_UID) showHub();
+            else hideHub();
         });
 
+        function hideHub() {
+            if (registryRef) { registryRef.off(); registryRef = null; }
+            if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+            document.getElementById('mainHubApp').classList.add('hidden');
+            document.getElementById('authScreen').classList.remove('hidden');
+        }
+
+        // [SỬA] Không đăng ký nghe trùng, tự thử lại 2 lần trước khi báo lỗi
         function showHub() {
             document.getElementById('authScreen').classList.add('hidden');
             document.getElementById('mainHubApp').classList.remove('hidden');
-            db.ref('registry').on('value', (snap) => {
+            if (registryRef) registryRef.off();
+            registryRef = db.ref('registry');
+            registryRef.on('value', (snap) => {
+                registryRetry = 0;
                 const v = snap.val() || {};
                 spas = Object.keys(v).map(id => ({ id, ...v[id] })).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
                 renderSpaList();
-            }, (e) => alert('Không tải được danh sách Spa: ' + e.message));
+            }, (e) => {
+                registryRef = null;
+                if (registryRetry < 2) {
+                    registryRetry++;
+                    setTimeout(() => { if (auth.currentUser && auth.currentUser.uid === KB.ADMIN_UID) showHub(); }, 2000);
+                } else {
+                    alert('Không tải được danh sách Spa: ' + e.message + '\nHãy đăng xuất rồi đăng nhập lại.');
+                }
+            });
             if (timerInterval) clearInterval(timerInterval);
             timerInterval = setInterval(updateAllCountdowns, 1000);
         }
@@ -208,7 +233,7 @@
                     <div class="flex flex-wrap items-center gap-2">
                         <button onclick="openExtendModal(${i})" class="px-2.5 py-1.5 bg-amber-50 text-amber-700 border border-amber-200 font-bold rounded-xl hover:bg-amber-100">➕ Gia hạn</button>
                         <button onclick="copyLink(${i})" class="px-2.5 py-1.5 bg-white text-gray-700 border border-gray-200 font-bold rounded-xl hover:bg-gray-100">📋 Copy link</button>
-                        <a href="${esc(posLink(spa))}" target="_blank" class="px-3 py-1.5 bg-purple-600 text-white font-bold rounded-xl shadow-sm hover:bg-purple-700">🔗 Truy cập POS</a>
+                        <a href="${esc(posLink(spa))}" target="_blank" rel="noopener" class="px-3 py-1.5 bg-purple-600 text-white font-bold rounded-xl shadow-sm hover:bg-purple-700">🔗 Truy cập POS</a>
                         <button onclick="toggleDisabled(${i})" class="px-2.5 py-1.5 bg-white text-gray-700 border border-gray-200 font-bold rounded-xl hover:bg-gray-100">${spa.disabled ? '🔓 Mở khóa' : '⛔ Khóa'}</button>
                         <button onclick="resetPassword(${i})" class="px-2.5 py-1.5 bg-white text-blue-700 border border-blue-200 font-bold rounded-xl hover:bg-blue-50">🔑 Đặt lại MK Admin spa</button>
                         <button onclick="deleteSpa(${i})" class="ml-auto px-2 py-1.5 bg-white text-red-500 border border-gray-200 font-bold rounded-xl">🗑</button>
