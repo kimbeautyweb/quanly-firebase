@@ -972,14 +972,22 @@
         function dbError(err) {
             console.error(err);
             if (err && /permission_denied/i.test(err.code || err.message || '')) alert('Bạn không có quyền thực hiện thao tác này, hoặc cơ sở đã hết hạn / bị khóa.');
+            else if (/quota|exceed|limit|disabled|storage|bandwidth/i.test((err && (err.code + ' ' + err.message)) || '')) alert('⚠️ HỆ THỐNG LƯU TRỮ ĐÃ ĐẠT GIỚI HẠN nên không lưu được dữ liệu vừa nhập.\n\nVui lòng báo Admin hệ thống để nâng cấp dung lượng.\n\n(Chi tiết: ' + (err.message || err) + ')');
             else alert('Không lưu được: ' + (err && err.message || err));
+        }
+        let _readErrShown = false;
+        function readError(path, e) {
+            console.error('Lỗi đọc dữ liệu ' + path, e);
+            if (_readErrShown || /permission_denied/i.test((e && (e.code + ' ' + e.message)) || '')) return;
+            _readErrShown = true;
+            alert('⚠️ Không đọc được dữ liệu từ hệ thống. Có thể hệ thống đang quá tải hoặc đã đạt giới hạn. Vui lòng thử lại sau hoặc liên hệ Admin.');
         }
         const wrapCb = (cb) => (err) => { if (err) dbError(err); if (cb) cb(err); };
         const db = {
             ref: (path) => {
                 const r = _fbdb.ref(path);
                 return {
-                    on: (ev, cb, errCb) => r.on(ev, cb, errCb || ((e) => console.error('Lỗi đọc dữ liệu ' + path, e))),
+                    on: (ev, cb, errCb) => r.on(ev, cb, errCb || ((e) => readError(path, e))),
                     off: (ev, cb) => r.off(ev, cb),
                     once: (ev, cb) => r.once(ev, cb),
                     set: (v, cb) => r.set(cleanVal(v), wrapCb(cb)),
