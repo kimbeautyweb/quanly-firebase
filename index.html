@@ -394,7 +394,6 @@
         async function deleteSpa(i) {
             const spa = spas[i];
             if (!confirm(`XÓA cơ sở "${spa.name}"?\n\nToàn bộ dữ liệu của cơ sở (khách hàng, lịch sử, tài khoản...) sẽ bị xóa vĩnh viễn và link POS ngừng hoạt động.`)) return;
-            if (prompt('Gõ đúng tên Spa để xác nhận xóa:') !== spa.name) { alert('Tên không khớp, đã hủy.'); return; }
             try {
                 const mSnap = await db.ref('members').orderByChild('spaId').equalTo(spa.id).once('value');
                 const upd = { ['spas/' + spa.id]: null, ['registry/' + spa.id]: null, ['loginIndex/' + spa.id]: null };
